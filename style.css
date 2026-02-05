@@ -403,8 +403,32 @@
 }
 
 /* ============================================
-   Inline Text Highlighting (for textarea overlay)
+   Inline Text Highlighting (textarea overlay)
    ============================================ */
+
+.st-spellcheck-highlight-overlay {
+    position: absolute;
+    pointer-events: none;
+    overflow: hidden;
+    color: transparent !important;
+    background: transparent !important;
+    z-index: 1;
+    box-sizing: border-box;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+.st-spellcheck-highlight-overlay .st-spellcheck-misspelled {
+    color: transparent;
+    text-decoration: wavy underline #e74c3c;
+    text-decoration-skip-ink: none;
+}
+
+/* Ensure textarea is positioned above overlay for interaction but below for text rendering */
+#send_textarea {
+    position: relative;
+    z-index: 2;
+}
 
 .st-spellcheck-misspelled {
     text-decoration: wavy underline #e74c3c;
