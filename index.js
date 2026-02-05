@@ -27,6 +27,9 @@ let undoStack = []; // Stores last 5 states
 const MAX_UNDO_STATES = 5;
 let isInitialized = false;
 let currentMisspellings = []; // Track current misspellings for UI
+let spellCheckDebounceTimer = null;
+const SPELL_CHECK_DEBOUNCE_MS = 500;
+let highlightOverlay = null;
 
 // Roleplay patterns to preserve
 const ROLEPLAY_PATTERNS = {
@@ -76,6 +79,11 @@ async function init() {
     log('Initializing extension...');
 
     try {
+        // Verify SillyTavern is available
+        if (typeof SillyTavern === 'undefined' || typeof SillyTavern.getContext !== 'function') {
+            throw new Error('SillyTavern global not available. Extension may have loaded before the app.');
+        }
+
         // Get SillyTavern context
         const context = SillyTavern.getContext();
 
@@ -182,6 +190,11 @@ function registerUI(context) {
 
     // Add settings panel
     addSettingsPanel();
+
+    // Setup highlight overlay for inline misspelled word highlights
+    if (extensionSettings.showInlineHighlights) {
+        setupHighlightOverlay();
+    }
 
     log('UI registered');
 }
@@ -692,6 +705,149 @@ function isSpellcheckEnabledForCharacter() {
 }
 
 /**
+ * Setup the highlight overlay div that sits on top of the textarea
+ * to display wavy underlines on misspelled words.
+ */
+function setupHighlightOverlay() {
+    const textArea = document.getElementById('send_textarea');
+    if (!textArea) {
+        logError('Cannot setup highlight overlay: send_textarea not found');
+        return;
+    }
+
+    // Remove existing overlay if any
+    const existing = document.getElementById('st-spellcheck-highlight-overlay');
+    if (existing) existing.remove();
+
+    // Create overlay div
+    highlightOverlay = document.createElement('div');
+    highlightOverlay.id = 'st-spellcheck-highlight-overlay';
+    highlightOverlay.className = 'st-spellcheck-highlight-overlay';
+    highlightOverlay.setAttribute('aria-hidden', 'true');
+
+    // Insert overlay as a sibling right before the textarea
+    textArea.parentElement.insertBefore(highlightOverlay, textArea);
+
+    // Copy text-related computed styles from textarea to overlay
+    syncOverlayStyles();
+
+    // Sync scroll position
+    textArea.addEventListener('scroll', () => {
+        if (highlightOverlay) {
+            highlightOverlay.scrollTop = textArea.scrollTop;
+            highlightOverlay.scrollLeft = textArea.scrollLeft;
+        }
+    });
+
+    // Watch for textarea resize to keep overlay in sync
+    if (typeof ResizeObserver !== 'undefined') {
+        const observer = new ResizeObserver(() => syncOverlayStyles());
+        observer.observe(textArea);
+    }
+
+    log('Highlight overlay initialized');
+}
+
+/**
+ * Sync overlay styles with the textarea so text positioning matches exactly.
+ */
+function syncOverlayStyles() {
+    const textArea = document.getElementById('send_textarea');
+    if (!textArea || !highlightOverlay) return;
+
+    const styles = window.getComputedStyle(textArea);
+
+    // Position the overlay exactly over the textarea
+    highlightOverlay.style.position = 'absolute';
+    highlightOverlay.style.top = `${textArea.offsetTop}px`;
+    highlightOverlay.style.left = `${textArea.offsetLeft}px`;
+    highlightOverlay.style.width = `${textArea.offsetWidth}px`;
+    highlightOverlay.style.height = `${textArea.offsetHeight}px`;
+
+    // Copy text rendering styles so characters align exactly
+    highlightOverlay.style.font = styles.font;
+    highlightOverlay.style.fontSize = styles.fontSize;
+    highlightOverlay.style.fontFamily = styles.fontFamily;
+    highlightOverlay.style.fontWeight = styles.fontWeight;
+    highlightOverlay.style.lineHeight = styles.lineHeight;
+    highlightOverlay.style.letterSpacing = styles.letterSpacing;
+    highlightOverlay.style.wordSpacing = styles.wordSpacing;
+    highlightOverlay.style.textIndent = styles.textIndent;
+    highlightOverlay.style.whiteSpace = styles.whiteSpace || 'pre-wrap';
+    highlightOverlay.style.wordWrap = styles.wordWrap || 'break-word';
+    highlightOverlay.style.overflowWrap = styles.overflowWrap || 'break-word';
+    highlightOverlay.style.padding = styles.padding;
+    highlightOverlay.style.border = `${styles.borderWidth} ${styles.borderStyle} transparent`;
+    highlightOverlay.style.boxSizing = styles.boxSizing;
+    highlightOverlay.style.tabSize = styles.tabSize;
+}
+
+/**
+ * Update the highlight overlay content with misspelled word markers.
+ * @param {string} text - The current textarea text
+ * @param {Array} misspellings - Array of misspelling objects with start/end/word
+ */
+function updateHighlightOverlay(text, misspellings = []) {
+    if (!highlightOverlay) return;
+
+    if (!text || misspellings.length === 0) {
+        highlightOverlay.innerHTML = '';
+        return;
+    }
+
+    // Sort misspellings by position (ascending)
+    const sorted = [...misspellings].sort((a, b) => a.start - b.start);
+
+    // Build HTML with misspelled words wrapped in highlight spans
+    let html = '';
+    let lastIndex = 0;
+
+    sorted.forEach(m => {
+        // Add text before this misspelling (invisible but takes up space)
+        html += escapeHtml(text.substring(lastIndex, m.start));
+        // Add highlighted misspelled word
+        html += `<span class="st-spellcheck-misspelled" data-word="${escapeHtml(m.word)}">${escapeHtml(m.word)}</span>`;
+        lastIndex = m.end;
+    });
+
+    // Add remaining text
+    html += escapeHtml(text.substring(lastIndex));
+
+    highlightOverlay.innerHTML = html;
+}
+
+/**
+ * Debounced handler for textarea input events.
+ * Runs spell check and updates badge + inline highlights as the user types.
+ */
+function handleTextAreaInput() {
+    if (!extensionSettings.enabled || !typoInstance) return;
+    if (!isSpellcheckEnabledForCharacter()) return;
+
+    clearTimeout(spellCheckDebounceTimer);
+    spellCheckDebounceTimer = setTimeout(() => {
+        const textArea = document.getElementById('send_textarea');
+        if (!textArea) return;
+
+        const text = textArea.value;
+        if (!text.trim()) {
+            updateHighlightOverlay('');
+            updateBadge(0);
+            currentMisspellings = [];
+            return;
+        }
+
+        const result = performLocalSpellCheck(text);
+        currentMisspellings = result.misspellings;
+        updateBadge(result.misspellings.length);
+
+        if (extensionSettings.showInlineHighlights) {
+            updateHighlightOverlay(text, result.misspellings);
+        }
+    }, SPELL_CHECK_DEBOUNCE_MS);
+}
+
+/**
  * Register event listeners
  * @param {object} context - SillyTavern context
  */
@@ -717,6 +873,14 @@ function registerEventListeners(context) {
                 }
             }
         });
+    }
+
+    // Real-time spell check on textarea input
+    const textArea = document.getElementById('send_textarea');
+    if (textArea) {
+        textArea.addEventListener('input', handleTextAreaInput);
+    } else {
+        logError('send_textarea not found, real-time spell check will not activate');
     }
 
     // Keyboard shortcuts
