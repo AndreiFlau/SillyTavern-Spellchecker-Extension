@@ -1,0 +1,14 @@
+{
+  "name": "st-spellcheck",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0",
+  "scripts": {
+    "build:engine": "esbuild tools/hunspell-entry.js --bundle --minify --format=esm --platform=browser --main-fields=browser,main --outfile=lib/hunspell.bundle.js",
+    "test": "node --test tests/spell-core.test.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "hunspell-asm": "4.0.2"
+  }
+}

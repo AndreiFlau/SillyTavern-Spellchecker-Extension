@@ -1,6 +1,8 @@
 # ST-Spellcheck
 
-**A lightweight, on-demand spelling and grammar checking tool for roleplay and creative writing in SillyTavern.**
+**Spell check for SillyTavern and TauriTavern that understands Brazilian Portuguese and US English at the same time, for people who switch languages mid-sentence.**
+
+This is a fork of [Cheesedozer/SillyTavern-Spellchecker-Extension](https://github.com/Cheesedozer/SillyTavern-Spellchecker-Extension). A word is only flagged if **both** dictionaries reject it, so `hello, como você está?` comes up clean. The browser's built-in spellchecker only handles one language at a time, and inside TauriTavern's WebView2 no setting changes that.
 
 ```
    _____ _______    _____            _ _      _               _
@@ -10,7 +12,7 @@
   ____) |  | |     ____) | |_) |  __/ | | (__| | | |  __/ (__|   <
  |_____/   |_|    |_____/| .__/ \___|_|_|\___|_| |_|\___|\___|_|\_\
                          | |
-                         |_|    v1.0.0 for SillyTavern 1.12.0+
+                         |_|    v2.0.0 for SillyTavern 1.12.0+
 ```
 
 ---
@@ -19,10 +21,11 @@
 
 ### Two-Mode Spell Checking System
 
-- **Local Spell Check** - Instant, offline spell checking using Typo.js with Hunspell dictionaries
-  - Zero latency, works without internet
-  - Detects misspellings with intelligent suggestions
-  - Right-click to see corrections or add words to dictionary
+- **Local Spell Check** - Instant, offline spell checking using the real Hunspell engine, compiled to WebAssembly
+  - Red underlines as you type, in the chat box
+  - Checks Portuguese and English together; nothing leaves your computer
+  - Right-click an underlined word to see corrections from both languages, closest first, or add it to your dictionary
+  - The names in the current chat are accepted automatically
 
 - **AI Polish** - Use your connected LLM to improve text
   - Enhances grammar, punctuation, and flow
@@ -37,7 +40,7 @@ Intelligently recognizes and preserves common roleplay conventions:
 |---------|---------|------------|
 | Stuttering | "I-I didn't mean to..." | Yes |
 | Ellipses | "I thought..." | Yes |
-| Action asterisks | *sighs heavily* | Yes |
+| Asterisks around actions | *sighs heavily* | Kept, and the words inside are still checked |
 | Tildes | "Please~" | Yes |
 | ALL CAPS shouting | "STOP RIGHT THERE!" | Yes |
 | Repeated letters | "Nooooo!" | Yes |
@@ -66,11 +69,9 @@ Intelligently recognizes and preserves common roleplay conventions:
 | Medium | Typos + basic grammar (periods, capitals) | Standard roleplay |
 | Heavy | Full rewrite for flow and clarity | Important posts |
 
-### Undo Functionality
+### Undo
 
-- Stores last 5 text states
-- "Undo" restores previous version
-- Keyboard shortcut: `Ctrl+Z` in input field
+Every correction goes through the chat box's normal history, so plain Ctrl+Z undoes it.
 
 ### Per-Character Settings
 
@@ -99,7 +100,7 @@ Intelligently recognizes and preserves common roleplay conventions:
 1. Open SillyTavern
 2. Go to **Extensions** > **Manage Extensions**
 3. Click **Install Extension**
-4. Enter the repository URL: `https://github.com/SillyTavern/ST-Spellcheck`
+4. Enter the repository URL: `https://github.com/AndreiFlau/SillyTavern-Spellchecker-Extension`
 5. Click **Install**
 6. Refresh SillyTavern
 
@@ -109,7 +110,7 @@ Intelligently recognizes and preserves common roleplay conventions:
 2. Go to `data/<your-user>/extensions/`
 3. Clone or download this repository:
    ```bash
-   git clone https://github.com/SillyTavern/ST-Spellcheck.git
+   git clone https://github.com/AndreiFlau/SillyTavern-Spellchecker-Extension.git
    ```
 4. Restart SillyTavern
 
@@ -235,7 +236,7 @@ Intelligently recognizes and preserves common roleplay conventions:
 **Problem:** "Spell check dictionary failed to load" error appears.
 
 **Solution:**
-- Ensure the `dictionaries/en_US/` folder contains `en_US.aff` and `en_US.dic` files
+- Ensure `dictionaries/pt_BR/` and `dictionaries/en_US/` each contain their `.aff` and `.dic` files
 - Check browser console for specific error messages
 - Try reinstalling the extension
 
@@ -278,6 +279,21 @@ Intelligently recognizes and preserves common roleplay conventions:
 
 ## Changelog
 
+### v2.0.0 (multi-language fork)
+
+- Checks Brazilian Portuguese and US English at the same time
+- Replaced Typo.js with Hunspell (WebAssembly): Typo.js could not finish loading the Portuguese dictionary in minutes, Hunspell loads both in under a second
+- Fixed the extension failing to load at all (`lib/typo.js` had no ES export)
+- Accented words are now one word; previously `você` was cut at the accent
+- Words inside `*actions*` are now checked
+- Right-click now works, and replaces only the word you clicked
+- Apply Selected now applies only what is ticked
+- Ctrl+Z is the normal undo again, and no longer discards what you typed since a correction
+- Turns off the built-in spellchecker in the chat box while active, and hands it back when disabled
+- Fixed the emoticon rule hiding typos before a colon or semicolon (`helo:`)
+- Fixed the AI Polish system prompt being lost, and slash commands crashing startup
+- Fixed menu text being invisible, and underlines drifting out of line with wrapped or scrolled text
+
 ### v1.0.0 (Initial Release)
 
 - Two-mode spell checking: Local (Typo.js) and AI Polish
@@ -294,8 +310,10 @@ Intelligently recognizes and preserves common roleplay conventions:
 
 ## Credits
 
-- **[Typo.js](https://github.com/cfinke/Typo.js)** by Christopher Finke - Hunspell dictionary spell checking
-- **[Hunspell Dictionaries](https://hunspell.github.io/)** - en_US dictionary files
+- **[Cheesedozer](https://github.com/Cheesedozer/SillyTavern-Spellchecker-Extension)** - The original extension
+- **[Hunspell](https://hunspell.github.io/)** via **[hunspell-asm](https://github.com/kwonoj/hunspell-asm)** - The spell check engine
+- **[VERO](https://pt-br.libreoffice.org/projetos/projeto-vero-verificador-ortografico/)** by Raimundo Moura and team, packaged by **[wooorm/dictionaries](https://github.com/wooorm/dictionaries)** - The pt_BR dictionary
+- See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for their licenses
 - **[SillyTavern Team](https://github.com/SillyTavern/SillyTavern)** - For the amazing platform and extension API
 
 ---
@@ -309,6 +327,16 @@ See the [LICENSE](LICENSE) file for details.
 This license was chosen to align with SillyTavern's licensing requirements for official extensions.
 
 ---
+
+## Development
+
+The engine bundle and the tests need Node.js:
+
+```
+npm install
+npm test                # checks the word logic against the real dictionaries
+npm run build:engine    # rebuilds lib/hunspell.bundle.js
+```
 
 ## Contributing
 

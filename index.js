@@ -1,13 +1,20 @@
 /**
  * ST-Spellcheck Extension for SillyTavern
- * A lightweight, on-demand spelling and grammar checking tool for roleplay and creative writing.
- * @version 1.0.0
+ * Checks Brazilian Portuguese and US English at the same time as you type, for people
+ * who switch languages mid-sentence. Roleplay-aware, with optional AI polish.
+ * @version 2.0.0
  */
 
-import { Typo } from './lib/typo.js';
+import { loadModule } from './lib/hunspell.bundle.js';
+import { createChecker, findMisspellings, findWords } from './lib/spell-core.js';
 
 const MODULE_NAME = 'ST-Spellcheck';
 const LOG_PREFIX = `[${MODULE_NAME}]`;
+
+// A word is accepted if any of these accepts it.
+const DICTIONARIES = ['pt_BR', 'en_US'];
+// Resolved from this file, so the extension works whatever its folder is called.
+const EXTENSION_ROOT = new URL('./', import.meta.url);
 
 // Extension settings defaults
 const DEFAULT_SETTINGS = {
@@ -21,35 +28,14 @@ const DEFAULT_SETTINGS = {
 };
 
 // State management
-let typoInstance = null;
+let checker = null;
 let extensionSettings = null;
-let undoStack = []; // Stores last 5 states
-const MAX_UNDO_STATES = 5;
 let isInitialized = false;
-let currentMisspellings = []; // Track current misspellings for UI
-let spellCheckDebounceTimer = null;
-const SPELL_CHECK_DEBOUNCE_MS = 500;
+let currentMisspellings = []; // What the overlay currently shows, for right-click lookups
+let liveCheckTimer = null;
+let typingCaret = null; // Where the caret was after the last edit, while the user is typing there
 let highlightOverlay = null;
-
-// Roleplay patterns to preserve
-const ROLEPLAY_PATTERNS = {
-    // Stuttering: "I-I", "W-what", "N-no"
-    stuttering: /\b([A-Za-z])-\1/gi,
-    // Action asterisks: *sighs*, *looks away*
-    actionAsterisks: /\*[^*]+\*/g,
-    // Tildes for drawn-out speech: "Please~", "Hello~"
-    tildes: /\w+~/g,
-    // Ellipses: "I thought...", "Maybe..."
-    ellipses: /\.{2,}/g,
-    // ALL CAPS for shouting (3+ chars)
-    allCaps: /\b[A-Z]{3,}\b/g,
-    // Repeated letters for emphasis: "Nooooo", "Pleeeease"
-    repeatedLetters: /(.)\1{2,}/g,
-    // Emotes/emoticons
-    emoticons: /[:;8][-']?[)(\[\]DPpOo3<>|/\\]+|[)(\[\]DPpOo][-']?[:;8]/g,
-    // Common RP abbreviations
-    rpAbbreviations: /\b(RP|OOC|IC|NPC|GM|DM|PC)\b/gi,
-};
+let knownNames = new Set(); // Lowercase words from the names in the current chat
 
 /**
  * Log message with extension prefix
@@ -90,8 +76,8 @@ async function init() {
         // Load extension settings
         await loadSettings(context);
 
-        // Initialize Typo.js spell checker
-        await initializeTypo();
+        await initializeDictionaries();
+        refreshKnownNames();
 
         // Register UI elements
         registerUI(context);
@@ -143,27 +129,44 @@ async function saveSettings() {
 }
 
 /**
- * Initialize Typo.js spell checker with en_US dictionary
+ * Fetch one Hunspell dictionary and load it into the engine.
+ * @param {object} factory - hunspell-asm factory
+ * @param {string} code - Dictionary folder and file name, such as pt_BR
  */
-async function initializeTypo() {
-    log('Loading Typo.js dictionary...');
+async function loadDictionary(factory, code) {
+    const fetchBytes = async (extension) => {
+        const url = new URL(`dictionaries/${code}/${code}.${extension}`, EXTENSION_ROOT);
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`${url} returned ${response.status}`);
+        return new Uint8Array(await response.arrayBuffer());
+    };
+    const [aff, dic] = await Promise.all([fetchBytes('aff'), fetchBytes('dic')]);
+    return factory.create(factory.mountBuffer(aff, `${code}.aff`), factory.mountBuffer(dic, `${code}.dic`));
+}
 
+/**
+ * Load every dictionary. One failing still leaves the other working, but says so.
+ */
+async function initializeDictionaries() {
     try {
-        const extensionPath = `scripts/extensions/third-party/${MODULE_NAME}`;
-
-        // Fetch dictionary files
-        const [affData, dicData] = await Promise.all([
-            fetch(`${extensionPath}/dictionaries/en_US/en_US.aff`).then(r => r.text()),
-            fetch(`${extensionPath}/dictionaries/en_US/en_US.dic`).then(r => r.text()),
-        ]);
-
-        // Create Typo instance
-        typoInstance = new Typo('en_US', affData, dicData, { platform: 'any' });
-
-        log('Dictionary loaded successfully');
+        const factory = await loadModule();
+        const results = await Promise.allSettled(DICTIONARIES.map((code) => loadDictionary(factory, code)));
+        const spellers = [];
+        results.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+                spellers.push(result.value);
+            } else {
+                logError(`Failed to load ${DICTIONARIES[index]}:`, result.reason);
+                showToast(`The ${DICTIONARIES[index]} dictionary failed to load, so its words will be flagged.`, 'warning');
+            }
+        });
+        if (spellers.length > 0) {
+            checker = createChecker(spellers);
+            log(`Loaded ${spellers.length} of ${DICTIONARIES.length} dictionaries`);
+        }
     } catch (error) {
-        logError('Failed to load dictionary:', error);
-        showToast('Spell check dictionary failed to load. Local spell check unavailable.', 'warning');
+        logError('Failed to start the spell check engine:', error);
+        showToast('The spell check engine failed to start. Spell check is unavailable.', 'error');
     }
 }
 
@@ -219,7 +222,7 @@ function addSpellcheckButtons() {
     spellCheckBtn.id = 'st-spellcheck-local-btn';
     spellCheckBtn.className = 'st-spellcheck-btn interactable';
     spellCheckBtn.title = 'Local Spell Check (Ctrl+Shift+S)';
-    spellCheckBtn.innerHTML = '<span class="st-spellcheck-icon">🔤</span><span class="st-spellcheck-badge" style="display:none;">0</span>';
+    spellCheckBtn.innerHTML = '<span class="st-spellcheck-icon fa-solid fa-spell-check"></span><span class="st-spellcheck-badge" style="display:none;">0</span>';
     spellCheckBtn.addEventListener('click', handleLocalSpellCheck);
 
     // AI Polish button
@@ -227,7 +230,7 @@ function addSpellcheckButtons() {
     aiPolishBtn.id = 'st-spellcheck-ai-btn';
     aiPolishBtn.className = 'st-spellcheck-btn interactable';
     aiPolishBtn.title = 'AI Polish (Ctrl+Shift+P)';
-    aiPolishBtn.innerHTML = '<span class="st-spellcheck-icon">✨</span>';
+    aiPolishBtn.innerHTML = '<span class="st-spellcheck-icon fa-solid fa-wand-magic-sparkles"></span>';
     aiPolishBtn.addEventListener('click', handleAIPolish);
 
     buttonContainer.appendChild(spellCheckBtn);
@@ -269,7 +272,7 @@ function addSettingsPanel() {
                         <input type="checkbox" id="st-spellcheck-roleplay-aware" />
                         <span>Roleplay-Aware Mode</span>
                     </label>
-                    <small class="st-spellcheck-hint">Preserves stuttering, ellipses, action asterisks, etc.</small>
+                    <small class="st-spellcheck-hint">Ignores stuttering, ALL CAPS, drawn-out words and emoticons. Words inside *actions* are still checked.</small>
                 </div>
 
                 <div class="st-spellcheck-setting">
@@ -340,6 +343,7 @@ function bindSettingsEvents() {
             extensionSettings.enabled = e.target.checked;
             saveSettings();
             updateButtonVisibility();
+            refreshSpellcheckState();
         });
     }
 
@@ -349,6 +353,7 @@ function bindSettingsEvents() {
         roleplayCheckbox.addEventListener('change', (e) => {
             extensionSettings.roleplayAwareMode = e.target.checked;
             saveSettings();
+            scheduleLiveCheck();
         });
     }
 
@@ -413,7 +418,10 @@ function bindSettingsEvents() {
     // Character toggle
     const charToggleBtn = document.getElementById('st-spellcheck-char-toggle-btn');
     if (charToggleBtn) {
-        charToggleBtn.addEventListener('click', toggleCharacterSpellcheck);
+        charToggleBtn.addEventListener('click', () => {
+            toggleCharacterSpellcheck();
+            refreshSpellcheckState();
+        });
     }
 }
 
@@ -498,6 +506,7 @@ function addToDictionary(word) {
         extensionSettings.customDictionary.push(normalizedWord);
         saveSettings();
         updateDictionaryList();
+        scheduleLiveCheck();
         showToast(`"${word}" added to dictionary`, 'success');
     } else {
         showToast(`"${word}" is already in dictionary`, 'info');
@@ -514,6 +523,7 @@ function removeFromDictionary(word) {
         extensionSettings.customDictionary.splice(index, 1);
         saveSettings();
         updateDictionaryList();
+        scheduleLiveCheck();
         showToast(`"${word}" removed from dictionary`, 'success');
     }
 }
@@ -641,7 +651,7 @@ function updateCharacterToggleUI() {
 
     if (!statusSpan || !toggleBtn) return;
 
-    if (!context.characterId) {
+    if (context.characterId === undefined || context.characterId === null) {
         statusSpan.textContent = 'No character selected';
         toggleBtn.disabled = true;
         return;
@@ -661,7 +671,7 @@ function updateCharacterToggleUI() {
  */
 function toggleCharacterSpellcheck() {
     const context = SillyTavern.getContext();
-    if (!context.characterId) return;
+    if (context.characterId === undefined || context.characterId === null) return;
 
     if (!extensionSettings.characterSettings[context.characterId]) {
         extensionSettings.characterSettings[context.characterId] = { enabled: true };
@@ -686,8 +696,7 @@ function updateCharacterDisabledIndicator() {
     const buttonContainer = document.getElementById('st-spellcheck-buttons');
     if (!buttonContainer) return;
 
-    const isDisabled = context.characterId &&
-        extensionSettings.characterSettings[context.characterId]?.enabled === false;
+    const isDisabled = !isSpellcheckEnabledForCharacter();
 
     buttonContainer.classList.toggle('st-spellcheck-char-disabled', isDisabled);
 }
@@ -698,7 +707,7 @@ function updateCharacterDisabledIndicator() {
  */
 function isSpellcheckEnabledForCharacter() {
     const context = SillyTavern.getContext();
-    if (!context.characterId) return true;
+    if (context.characterId === undefined || context.characterId === null) return true;
 
     const charSettings = extensionSettings.characterSettings[context.characterId];
     return charSettings?.enabled !== false;
@@ -759,10 +768,16 @@ function syncOverlayStyles() {
 
     // Position the overlay exactly over the textarea
     highlightOverlay.style.position = 'absolute';
-    highlightOverlay.style.top = `${textArea.offsetTop}px`;
-    highlightOverlay.style.left = `${textArea.offsetLeft}px`;
-    highlightOverlay.style.width = `${textArea.offsetWidth}px`;
-    highlightOverlay.style.height = `${textArea.offsetHeight}px`;
+    const box = textArea.getBoundingClientRect();
+    const parent = highlightOverlay.offsetParent?.getBoundingClientRect() ?? { top: 0, left: 0 };
+    const parentElement = highlightOverlay.offsetParent;
+    highlightOverlay.style.top = `${box.top - parent.top - (parentElement?.clientTop ?? 0) + (parentElement?.scrollTop ?? 0)}px`;
+    highlightOverlay.style.left = `${box.left - parent.left - (parentElement?.clientLeft ?? 0) + (parentElement?.scrollLeft ?? 0)}px`;
+    // A scrollbar narrows the textarea's text but not the overlay's, so leave its width out.
+    const scrollbarWidth = textArea.offsetWidth - textArea.clientWidth
+        - parseFloat(styles.borderLeftWidth) - parseFloat(styles.borderRightWidth);
+    highlightOverlay.style.width = `${box.width - scrollbarWidth}px`;
+    highlightOverlay.style.height = `${box.height}px`;
 
     // Copy text rendering styles so characters align exactly
     highlightOverlay.style.font = styles.font;
@@ -777,7 +792,10 @@ function syncOverlayStyles() {
     highlightOverlay.style.wordWrap = styles.wordWrap || 'break-word';
     highlightOverlay.style.overflowWrap = styles.overflowWrap || 'break-word';
     highlightOverlay.style.padding = styles.padding;
-    highlightOverlay.style.border = `${styles.borderWidth} ${styles.borderStyle} transparent`;
+    // Side by side, because a shorthand with per-side widths is not a valid border value
+    for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
+        highlightOverlay.style[`border${side}`] = `${styles[`border${side}Width`]} solid transparent`;
+    }
     highlightOverlay.style.boxSizing = styles.boxSizing;
     highlightOverlay.style.tabSize = styles.tabSize;
 }
@@ -795,56 +813,103 @@ function updateHighlightOverlay(text, misspellings = []) {
         return;
     }
 
-    // Sort misspellings by position (ascending)
-    const sorted = [...misspellings].sort((a, b) => a.start - b.start);
-
-    // Build HTML with misspelled words wrapped in highlight spans
     let html = '';
     let lastIndex = 0;
 
-    sorted.forEach(m => {
-        // Add text before this misspelling (invisible but takes up space)
+    misspellings.forEach((m, index) => {
+        // Text around the misspelling is invisible but takes up the same space
         html += escapeHtml(text.substring(lastIndex, m.start));
-        // Add highlighted misspelled word
-        html += `<span class="st-spellcheck-misspelled" data-word="${escapeHtml(m.word)}">${escapeHtml(m.word)}</span>`;
+        html += `<span class="st-spellcheck-misspelled" data-index="${index}">${escapeHtml(m.word)}</span>`;
         lastIndex = m.end;
     });
 
-    // Add remaining text
-    html += escapeHtml(text.substring(lastIndex));
+    // The zero-width space gives a trailing newline a line to occupy, as a textarea does
+    html += escapeHtml(text.substring(lastIndex)) + '\u200b';
 
     highlightOverlay.innerHTML = html;
+
+    const textArea = document.getElementById('send_textarea');
+    if (textArea) {
+        highlightOverlay.scrollTop = textArea.scrollTop;
+        highlightOverlay.scrollLeft = textArea.scrollLeft;
+    }
 }
 
 /**
- * Debounced handler for textarea input events.
- * Runs spell check and updates badge + inline highlights as the user types.
+ * Whether the chat box should be checked right now.
  */
-function handleTextAreaInput() {
-    if (!extensionSettings.enabled || !typoInstance) return;
-    if (!isSpellcheckEnabledForCharacter()) return;
+function isLiveCheckActive() {
+    return Boolean(extensionSettings?.enabled && checker && isSpellcheckEnabledForCharacter());
+}
 
-    clearTimeout(spellCheckDebounceTimer);
-    spellCheckDebounceTimer = setTimeout(() => {
-        const textArea = document.getElementById('send_textarea');
-        if (!textArea) return;
+/**
+ * Check the chat box soon. Several changes in one tick (typing, then the caret moving)
+ * collapse into one check. Checking is fast enough to skip a longer debounce, which would
+ * leave the underlines out of step with the text while typing.
+ */
+function scheduleLiveCheck() {
+    if (liveCheckTimer !== null) return;
+    liveCheckTimer = setTimeout(() => {
+        liveCheckTimer = null;
+        runLiveCheck();
+    }, 0);
+}
 
-        const text = textArea.value;
-        if (!text.trim()) {
-            updateHighlightOverlay('');
-            updateBadge(0);
-            currentMisspellings = [];
-            return;
+/**
+ * Check the chat box and update the underlines and badge.
+ */
+function runLiveCheck() {
+    const textArea = document.getElementById('send_textarea');
+    if (!textArea) return;
+
+    if (!isLiveCheckActive()) {
+        currentMisspellings = [];
+        updateHighlightOverlay('');
+        updateBadge(0);
+        return;
+    }
+
+    // Leave a word alone while it is being typed. Only typing counts: clicking into a flagged
+    // word must not hide its underline, or a right-click would remove what it is aiming at.
+    const isTyping = document.activeElement === textArea && textArea.selectionStart === typingCaret;
+    if (!isTyping) typingCaret = null;
+    const text = textArea.value;
+    currentMisspellings = performLocalSpellCheck(text, { caret: isTyping ? typingCaret : null }).misspellings;
+    syncOverlayStyles();
+    updateBadge(currentMisspellings.length);
+    updateHighlightOverlay(extensionSettings.showInlineHighlights ? text : '', currentMisspellings);
+}
+
+/**
+ * Apply the on/off state. The browser's own spellchecker only knows one language, so it
+ * has to be off in the chat box while this one is on, or English gets flagged underneath.
+ */
+function refreshSpellcheckState() {
+    const textArea = document.getElementById('send_textarea');
+    if (textArea) {
+        if (isLiveCheckActive()) {
+            textArea.spellcheck = false;
+        } else {
+            // Falls back to the app's own spellcheck setting
+            textArea.removeAttribute('spellcheck');
         }
+    }
+    scheduleLiveCheck();
+}
 
-        const result = performLocalSpellCheck(text);
-        currentMisspellings = result.misspellings;
-        updateBadge(result.misspellings.length);
-
-        if (extensionSettings.showInlineHighlights) {
-            updateHighlightOverlay(text, result.misspellings);
-        }
-    }, SPELL_CHECK_DEBOUNCE_MS);
+/**
+ * Collect the names in the current chat, which no dictionary will know.
+ */
+function refreshKnownNames() {
+    const context = SillyTavern.getContext();
+    const names = [context.name1, context.name2];
+    const group = context.groupId ? context.groups?.find((g) => g.id === context.groupId) : null;
+    for (const avatar of group?.members ?? []) {
+        names.push(context.characters?.find((c) => c.avatar === avatar)?.name);
+    }
+    knownNames = new Set(
+        names.filter(Boolean).flatMap((name) => findWords(name).map(({ word }) => word.toLowerCase())),
+    );
 }
 
 /**
@@ -857,6 +922,8 @@ function registerEventListeners(context) {
         context.eventSource.on(context.eventTypes.CHAT_CHANGED, () => {
             updateCharacterToggleUI();
             updateCharacterDisabledIndicator();
+            refreshKnownNames();
+            refreshSpellcheckState();
         });
 
         // Auto-check before send if enabled
@@ -878,7 +945,16 @@ function registerEventListeners(context) {
     // Real-time spell check on textarea input
     const textArea = document.getElementById('send_textarea');
     if (textArea) {
-        textArea.addEventListener('input', handleTextAreaInput);
+        textArea.addEventListener('input', () => {
+            typingCaret = textArea.selectionStart === textArea.selectionEnd ? textArea.selectionStart : null;
+            scheduleLiveCheck();
+        });
+        textArea.addEventListener('blur', scheduleLiveCheck);
+        // Moving the caret off a word finishes it
+        document.addEventListener('selectionchange', () => {
+            if (document.activeElement === textArea) scheduleLiveCheck();
+        });
+        refreshSpellcheckState();
     } else {
         logError('send_textarea not found, real-time spell check will not activate');
     }
@@ -895,14 +971,6 @@ function registerEventListeners(context) {
             e.preventDefault();
             handleAIPolish();
         }
-        // Ctrl+Z in textarea for undo (only if we have undo states)
-        if (e.ctrlKey && e.key === 'z' && undoStack.length > 0) {
-            const textArea = document.getElementById('send_textarea');
-            if (document.activeElement === textArea) {
-                e.preventDefault();
-                handleUndo();
-            }
-        }
     });
 
     // Context menu for adding words to dictionary
@@ -914,29 +982,29 @@ function registerEventListeners(context) {
  * @param {object} context - SillyTavern context
  */
 function registerSlashCommands(context) {
-    if (context.SlashCommandParser) {
+    if (context.SlashCommandParser && context.SlashCommand) {
         // /spellcheck command
-        context.SlashCommandParser.addCommandObject({
+        context.SlashCommandParser.addCommandObject(context.SlashCommand.fromProps({
             name: 'spellcheck',
             callback: async (args, value) => {
                 await handleLocalSpellCheck();
                 return '';
             },
             helpString: 'Run local spell check on the current input',
-        });
+        }));
 
         // /aipolish command
-        context.SlashCommandParser.addCommandObject({
+        context.SlashCommandParser.addCommandObject(context.SlashCommand.fromProps({
             name: 'aipolish',
             callback: async (args, value) => {
                 await handleAIPolish();
                 return '';
             },
             helpString: 'Run AI polish on the current input',
-        });
+        }));
 
         // /addword command
-        context.SlashCommandParser.addCommandObject({
+        context.SlashCommandParser.addCommandObject(context.SlashCommand.fromProps({
             name: 'addword',
             callback: (args, value) => {
                 if (value) {
@@ -945,7 +1013,7 @@ function registerSlashCommands(context) {
                 return '';
             },
             helpString: 'Add a word to the spell check dictionary',
-        });
+        }));
     }
 }
 
@@ -954,28 +1022,46 @@ function registerSlashCommands(context) {
  * @param {Event} e - Context menu event
  */
 function handleContextMenu(e) {
-    // Check if we right-clicked on a misspelled word highlight
-    if (e.target.classList.contains('st-spellcheck-misspelled')) {
+    if (e.target?.id !== 'send_textarea') return;
+
+    // The overlay lets clicks through to the textarea, so find the word by position
+    const misspelling = findMisspellingAt(e.clientX, e.clientY);
+    if (misspelling) {
         e.preventDefault();
-        const word = e.target.dataset.word;
-        if (word) {
-            showWordContextMenu(e, word);
+        showWordContextMenu(e, misspelling);
+    }
+}
+
+/**
+ * Find the underlined word at a point on screen.
+ * @param {number} x - Client X
+ * @param {number} y - Client Y
+ * @returns {object|undefined} The misspelling there, if any
+ */
+function findMisspellingAt(x, y) {
+    for (const span of highlightOverlay?.querySelectorAll('.st-spellcheck-misspelled') ?? []) {
+        for (const rect of span.getClientRects()) {
+            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+                return currentMisspellings[Number(span.dataset.index)];
+            }
         }
     }
+    return undefined;
 }
 
 /**
  * Show context menu for a misspelled word
  * @param {Event} e - Mouse event
- * @param {string} word - The misspelled word
+ * @param {object} misspelling - The misspelled word and where it is
  */
-function showWordContextMenu(e, word) {
+function showWordContextMenu(e, misspelling) {
+    const { word } = misspelling;
     // Remove any existing context menu
     const existingMenu = document.querySelector('.st-spellcheck-context-menu');
     if (existingMenu) existingMenu.remove();
 
     // Get suggestions
-    const suggestions = typoInstance ? typoInstance.suggest(word, 5) : [];
+    const suggestions = checker ? checker.suggest(word) : [];
 
     const menu = document.createElement('div');
     menu.className = 'st-spellcheck-context-menu';
@@ -1000,7 +1086,7 @@ function showWordContextMenu(e, word) {
     // Bind events
     menu.querySelectorAll('.st-spellcheck-suggestion').forEach(item => {
         item.addEventListener('click', () => {
-            applySuggestion(word, item.dataset.suggestion);
+            applySuggestion(misspelling, item.dataset.suggestion);
             menu.remove();
         });
     });
@@ -1008,11 +1094,19 @@ function showWordContextMenu(e, word) {
     menu.querySelector('.st-spellcheck-add-dict').addEventListener('click', () => {
         addToDictionary(word);
         menu.remove();
-        // Re-run spell check to update highlights
-        handleLocalSpellCheck();
     });
 
     document.body.appendChild(menu);
+
+    // The chat box sits at the bottom of the window, so open upward when there is no room below
+    const { width, height } = menu.getBoundingClientRect();
+    if (e.clientY + height > window.innerHeight) {
+        const lineHeight = parseFloat(window.getComputedStyle(e.target).lineHeight) || 20;
+        menu.style.top = `${Math.max(0, e.pageY - height - lineHeight)}px`;
+    }
+    if (e.clientX + width > window.innerWidth) {
+        menu.style.left = `${Math.max(0, e.pageX - width)}px`;
+    }
 
     // Close menu when clicking elsewhere
     const closeMenu = (e) => {
@@ -1026,58 +1120,38 @@ function showWordContextMenu(e, word) {
 
 /**
  * Apply a spelling suggestion
- * @param {string} original - Original word
+ * @param {object} misspelling - The misspelled word and where it is
  * @param {string} suggestion - Suggested replacement
  */
-function applySuggestion(original, suggestion) {
+function applySuggestion(misspelling, suggestion) {
     const textArea = document.getElementById('send_textarea');
     if (!textArea) return;
 
-    // Save undo state
-    saveUndoState(textArea.value);
-
-    // Replace the word
-    const regex = new RegExp(`\\b${escapeRegex(original)}\\b`, 'g');
-    textArea.value = textArea.value.replace(regex, suggestion);
-
-    showToast(`Replaced "${original}" with "${suggestion}"`, 'success');
-}
-
-/**
- * Escape special regex characters
- * @param {string} str - String to escape
- * @returns {string} Escaped string
- */
-function escapeRegex(str) {
-    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/**
- * Save current state to undo stack
- * @param {string} text - Text to save
- */
-function saveUndoState(text) {
-    undoStack.push(text);
-    if (undoStack.length > MAX_UNDO_STATES) {
-        undoStack.shift();
-    }
-}
-
-/**
- * Handle undo action
- */
-function handleUndo() {
-    if (undoStack.length === 0) {
-        showToast('Nothing to undo', 'info');
+    const { word, start, end } = misspelling;
+    if (textArea.value.slice(start, end) !== word) {
+        showToast('The text changed, so the suggestion was not applied.', 'info');
+        scheduleLiveCheck();
         return;
     }
 
-    const textArea = document.getElementById('send_textarea');
-    if (!textArea) return;
+    replaceTextRange(textArea, start, end, suggestion);
+}
 
-    const previousState = undoStack.pop();
-    textArea.value = previousState;
-    showToast('Undo successful', 'success');
+/**
+ * Replace part of the chat box the way typing would: it stays on the normal Ctrl+Z history,
+ * and the app and this extension both see the change.
+ * @param {HTMLTextAreaElement} textArea
+ * @param {number} start
+ * @param {number} end
+ * @param {string} text
+ */
+function replaceTextRange(textArea, start, end, text) {
+    textArea.focus();
+    textArea.setSelectionRange(start, end);
+    if (!document.execCommand('insertText', false, text)) {
+        textArea.setRangeText(text, start, end, 'end');
+        textArea.dispatchEvent(new Event('input', { bubbles: true }));
+    }
 }
 
 /**
@@ -1094,7 +1168,7 @@ async function handleLocalSpellCheck() {
         return;
     }
 
-    if (!typoInstance) {
+    if (!checker) {
         showToast('Dictionary not loaded. Cannot perform spell check.', 'error');
         return;
     }
@@ -1117,8 +1191,10 @@ async function handleLocalSpellCheck() {
     // Update badge
     updateBadge(result.misspellings.length);
 
-    // Store misspellings for potential use
-    currentMisspellings = result.misspellings;
+    // Suggestions are slower than checking, so they are only worked out here and on right-click
+    for (const misspelling of result.misspellings) {
+        misspelling.suggestions = checker.suggest(misspelling.word);
+    }
 
     // Show diff preview
     await showSpellCheckPreview(textArea.value, result);
@@ -1127,66 +1203,17 @@ async function handleLocalSpellCheck() {
 /**
  * Perform local spell check on text
  * @param {string} text - Text to check
- * @returns {object} Result with misspellings and corrections
+ * @param {object} [options]
+ * @param {number|null} [options.caret] - Offset of a word still being typed, to skip
+ * @returns {{misspellings: {word: string, start: number, end: number}[]}} What was found
  */
-function performLocalSpellCheck(text) {
-    const misspellings = [];
-    const protectedRanges = [];
-
-    // Find protected ranges (roleplay patterns) if roleplay-aware mode is on
-    if (extensionSettings.roleplayAwareMode) {
-        for (const [patternName, pattern] of Object.entries(ROLEPLAY_PATTERNS)) {
-            let match;
-            const regex = new RegExp(pattern.source, pattern.flags);
-            while ((match = regex.exec(text)) !== null) {
-                protectedRanges.push({
-                    start: match.index,
-                    end: match.index + match[0].length,
-                    pattern: patternName,
-                });
-            }
-        }
-    }
-
-    // Extract words (including hyphenated)
-    const wordPattern = /\b[a-zA-Z]+(?:[-'][a-zA-Z]+)*\b/g;
-    let match;
-
-    while ((match = wordPattern.exec(text)) !== null) {
-        const word = match[0];
-        const start = match.index;
-        const end = start + word.length;
-
-        // Skip if in protected range
-        const isProtected = protectedRanges.some(range =>
-            (start >= range.start && start < range.end) ||
-            (end > range.start && end <= range.end)
-        );
-
-        if (isProtected) continue;
-
-        // Skip if in custom dictionary
-        if (extensionSettings.customDictionary.includes(word.toLowerCase())) continue;
-
-        // Skip short words (1-2 chars)
-        if (word.length <= 2) continue;
-
-        // Skip ALL CAPS words if roleplay-aware
-        if (extensionSettings.roleplayAwareMode && word === word.toUpperCase()) continue;
-
-        // Check spelling
-        if (!typoInstance.check(word)) {
-            const suggestions = typoInstance.suggest(word, 5);
-            misspellings.push({
-                word,
-                start,
-                end,
-                suggestions,
-            });
-        }
-    }
-
-    return { misspellings, protectedRanges };
+function performLocalSpellCheck(text, { caret = null } = {}) {
+    const misspellings = findMisspellings(text, checker, {
+        roleplayAware: extensionSettings.roleplayAwareMode,
+        knownWords: new Set([...extensionSettings.customDictionary, ...knownNames]),
+        caret,
+    });
+    return { misspellings };
 }
 
 /**
@@ -1230,6 +1257,11 @@ async function showSpellCheckPreview(originalText, result) {
             });
         }
     });
+
+    if (changes.length === 0) {
+        showToast(`Found ${misspellings.length} unknown word(s), but no suggestions for them.`, 'info');
+        return;
+    }
 
     // Show preview popup
     const popupHtml = createDiffPopupHtml(originalText, suggestedText, changes.reverse(), 'Local Spell Check');
@@ -1300,6 +1332,7 @@ async function performAIPolish(text, context) {
 - Character-specific speech patterns
 - Intentional stylistic choices
 - ALL CAPS for shouting or emphasis
+- The language of each passage. The text may switch languages midway; never translate it.
 
 Return ONLY the corrected text with no explanations, commentary, or markdown formatting.
 Correction intensity: ${intensity}
@@ -1307,15 +1340,8 @@ ${intensity === 'LIGHT' ? '- Only fix obvious typos and misspellings' : ''}
 ${intensity === 'MEDIUM' ? '- Fix typos, basic grammar, missing periods, and capitalization' : ''}
 ${intensity === 'HEAVY' ? '- Full rewrite for improved flow and clarity while preserving meaning' : ''}`;
 
-    // Use generateQuietPrompt for background generation
-    if (typeof context.generateQuietPrompt === 'function') {
-        const result = await context.generateQuietPrompt(text, false, false, '', '', systemPrompt);
-        return result.trim();
-    }
-
-    // Fallback to generateRaw if available
     if (typeof context.generateRaw === 'function') {
-        const result = await context.generateRaw(text, '', false, false, systemPrompt);
+        const result = await context.generateRaw({ prompt: text, systemPrompt });
         return result.trim();
     }
 
@@ -1532,11 +1558,9 @@ async function showDiffPopup(html, originalText, suggestedText, changes) {
 
         if (acceptAll) {
             acceptAll.addEventListener('click', () => {
-                saveUndoState(textArea.value);
-                textArea.value = suggestedText;
+                replaceTextRange(textArea, 0, textArea.value.length, suggestedText);
                 showToast(`${changes.length} corrections applied`, 'success');
                 overlay.remove();
-                updateBadge(0);
                 resolve(true);
             });
         }
@@ -1545,7 +1569,6 @@ async function showDiffPopup(html, originalText, suggestedText, changes) {
             rejectAll.addEventListener('click', () => {
                 showToast('All changes rejected', 'info');
                 overlay.remove();
-                updateBadge(0);
                 resolve(false);
             });
         }
@@ -1553,39 +1576,32 @@ async function showDiffPopup(html, originalText, suggestedText, changes) {
         if (applySelected) {
             applySelected.addEventListener('click', () => {
                 const checkboxes = overlay.querySelectorAll('.st-spellcheck-change-checkbox');
-                let appliedText = originalText;
-                let appliedCount = 0;
+                const selected = changes.filter((_, index) => checkboxes[index]?.checked);
 
-                // Apply changes in reverse order to preserve positions
-                const selectedChanges = [];
-                checkboxes.forEach((cb, idx) => {
-                    if (cb.checked && changes[idx]) {
-                        selectedChanges.push(changes[idx]);
-                    }
-                });
-
-                if (selectedChanges.length === changes.length) {
-                    // All selected, use suggested text
-                    appliedText = suggestedText;
-                    appliedCount = selectedChanges.length;
-                } else if (selectedChanges.length > 0) {
-                    // Partial selection - need to apply individual changes
-                    // This is a simplified approach
-                    appliedText = suggestedText;
-                    appliedCount = selectedChanges.length;
-                }
-
-                if (appliedCount > 0) {
-                    saveUndoState(textArea.value);
-                    textArea.value = appliedText;
-                    showToast(`${appliedCount} corrections applied`, 'success');
-                } else {
+                if (selected.length === 0) {
                     showToast('No changes selected', 'info');
+                    overlay.remove();
+                    resolve(false);
+                    return;
                 }
 
+                let appliedText = suggestedText;
+                if (selected.length < changes.length) {
+                    // AI polish changes come from a diff and have no positions to apply one by one
+                    if (selected.some((change) => typeof change.start !== 'number')) {
+                        showToast('AI changes can only be accepted together. Use Accept All or Cancel.', 'info');
+                        return;
+                    }
+                    // From the end backward, so earlier offsets stay valid
+                    appliedText = [...selected].sort((a, b) => b.start - a.start).reduce((text, change) => (
+                        text.slice(0, change.start) + change.suggested + text.slice(change.start + change.original.length)
+                    ), originalText);
+                }
+
+                replaceTextRange(textArea, 0, textArea.value.length, appliedText);
+                showToast(`${selected.length} corrections applied`, 'success');
                 overlay.remove();
-                updateBadge(0);
-                resolve(appliedCount > 0);
+                resolve(true);
             });
         }
 
