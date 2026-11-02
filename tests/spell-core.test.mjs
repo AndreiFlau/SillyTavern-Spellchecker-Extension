@@ -67,6 +67,11 @@ test('non-prose is skipped', () => {
     assert.deepEqual(flagged('h264 my_vra 10th'), []);
 });
 
+test('prompt syntax is skipped', () => {
+    assert.deepEqual(flagged('<|im_start|>system [INST] hello [/INST] <|im_end|> [SYS_MSG]'), []);
+    assert.deepEqual(flagged('[wrold] hello'), ['wrold']);
+});
+
 test('the word being typed is not flagged until the caret leaves it', () => {
     const text = 'hello xqzw';
     assert.deepEqual(flagged(text, { caret: text.length }), []);

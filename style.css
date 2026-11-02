@@ -188,6 +188,7 @@
     z-index: 10000;
     min-width: 160px;
     padding: 4px 0;
+    text-align: left;
     background-color: #181818;
     background-image: linear-gradient(var(--SmartThemeBlurTintColor, transparent), var(--SmartThemeBlurTintColor, transparent));
     color: var(--SmartThemeBodyColor, #ddd);
@@ -429,6 +430,8 @@
     overflow: hidden;
     color: transparent !important;
     background: transparent !important;
+    top: 0;
+    left: 0;
     /* Above the textarea, so an opaque theme background cannot hide the underlines.
        pointer-events: none keeps every click and keystroke going to the textarea. */
     z-index: 3;
@@ -436,6 +439,12 @@
     box-sizing: border-box;
     white-space: pre-wrap;
     word-wrap: break-word;
+}
+
+/* Rich prompt editors: painted by the browser, without changing the page */
+::highlight(st-spellcheck-misspelled) {
+    text-decoration: wavy underline #e74c3c;
+    text-decoration-skip-ink: none;
 }
 
 .st-spellcheck-misspelled {

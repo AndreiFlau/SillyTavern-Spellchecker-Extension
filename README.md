@@ -19,6 +19,8 @@ This is a fork of [Cheesedozer/SillyTavern-Spellchecker-Extension](https://githu
 
 ## Simple mode and the Windows spell checker
 
+**Every prose field in the app is checked**: the chat box, message editing, system prompts, character descriptions, personas, lorebook entries and so on, including the rich prompt editors. Underlines appear once you click into a box, like a browser's spellchecker, and nothing extra is added to those screens. The browser's own spellchecker is switched off across the app while this is on. Single-line fields (API keys, URLs, names, searches) and code or technical fields (CSS, JSON, regex, stop strings, token sequences) get no underlines.
+
 **Simple mode** is on by default: squiggly underlines and right-click corrections, like a browser's spellchecker. Untick it in the extension's settings to get the buttons, the roleplay exceptions and AI Polish.
 
 **To use the Windows spell checker** (recommended on Windows), a browser extension needs a small helper, because it cannot reach Windows by itself:
@@ -294,6 +296,7 @@ Every correction goes through the chat box's normal history, so plain Ctrl+Z und
 
 ### v2.0.0 (multi-language fork)
 
+- Checks every prose text area in the app, and turns the browser's own spellchecker off across the app
 - Simple mode, on by default: only squiggly underlines and right-click corrections
 - Can use the Windows spell checker through a small helper, falling back to the built-in dictionaries
 - The local spell check button is now optional, and off by default: turn it on with **Show spell check button in the chat bar**

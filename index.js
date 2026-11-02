@@ -5,6 +5,7 @@
  * @version 2.0.0
  */
 
+import { createFieldChecking, replaceTextRange } from './lib/field-checker.js';
 import { createChecker, findMisspellings, findWords, normalizeApostrophes, wordsToLookUp } from './lib/spell-core.js';
 import { connectWindowsEngine } from './lib/windows-engine.js';
 
@@ -33,13 +34,9 @@ const DEFAULT_SETTINGS = {
 let checker = null;
 let engine = null; // The Windows helper's connection, or null when using the built-in dictionaries
 let engineName = 'Not loaded';
-let liveCheckGeneration = 0; // Lets a slow check notice that a newer one has replaced it
 let extensionSettings = null;
 let isInitialized = false;
-let currentMisspellings = []; // What the overlay currently shows, for right-click lookups
-let liveCheckTimer = null;
-let typingCaret = null; // Where the caret was after the last edit, while the user is typing there
-let highlightOverlay = null;
+let fieldChecking = null;
 let knownNames = new Set(); // Lowercase words from the names in the current chat
 
 /**
@@ -264,11 +261,6 @@ function registerUI(context) {
 
     // Add settings panel
     addSettingsPanel();
-
-    // Setup highlight overlay for inline misspelled word highlights
-    if (extensionSettings.showInlineHighlights) {
-        setupHighlightOverlay();
-    }
 
     log('UI registered');
 }
@@ -847,193 +839,59 @@ function isSpellcheckEnabledForCharacter() {
 }
 
 /**
- * Setup the highlight overlay div that sits on top of the textarea
- * to display wavy underlines on misspelled words.
+ * Whether spell check is on at all. The app's own Spellcheck setting turns this off too.
  */
-function setupHighlightOverlay() {
-    const textArea = document.getElementById('send_textarea');
-    if (!textArea) {
-        logError('Cannot setup highlight overlay: send_textarea not found');
-        return;
-    }
-
-    // Remove existing overlay if any
-    const existing = document.getElementById('st-spellcheck-highlight-overlay');
-    if (existing) existing.remove();
-
-    // Create overlay div
-    highlightOverlay = document.createElement('div');
-    highlightOverlay.id = 'st-spellcheck-highlight-overlay';
-    highlightOverlay.className = 'st-spellcheck-highlight-overlay';
-    highlightOverlay.setAttribute('aria-hidden', 'true');
-
-    // Insert overlay as a sibling right before the textarea
-    textArea.parentElement.insertBefore(highlightOverlay, textArea);
-
-    // Copy text-related computed styles from textarea to overlay
-    syncOverlayStyles();
-
-    // Sync scroll position
-    textArea.addEventListener('scroll', () => {
-        if (highlightOverlay) {
-            highlightOverlay.scrollTop = textArea.scrollTop;
-            highlightOverlay.scrollLeft = textArea.scrollLeft;
-        }
-    });
-
-    // Watch for textarea resize to keep overlay in sync
-    if (typeof ResizeObserver !== 'undefined') {
-        const observer = new ResizeObserver(() => syncOverlayStyles());
-        observer.observe(textArea);
-    }
-
-    log('Highlight overlay initialized');
+function isSpellcheckOn() {
+    const appSetting = SillyTavern.getContext().powerUserSettings?.spellcheck_enabled !== false;
+    return Boolean(extensionSettings?.enabled && checker && appSetting);
 }
 
 /**
- * Sync overlay styles with the textarea so text positioning matches exactly.
- */
-function syncOverlayStyles() {
-    const textArea = document.getElementById('send_textarea');
-    if (!textArea || !highlightOverlay) return;
-
-    const styles = window.getComputedStyle(textArea);
-
-    // Position the overlay exactly over the textarea
-    highlightOverlay.style.position = 'absolute';
-    const box = textArea.getBoundingClientRect();
-    const parent = highlightOverlay.offsetParent?.getBoundingClientRect() ?? { top: 0, left: 0 };
-    const parentElement = highlightOverlay.offsetParent;
-    highlightOverlay.style.top = `${box.top - parent.top - (parentElement?.clientTop ?? 0) + (parentElement?.scrollTop ?? 0)}px`;
-    highlightOverlay.style.left = `${box.left - parent.left - (parentElement?.clientLeft ?? 0) + (parentElement?.scrollLeft ?? 0)}px`;
-    // A scrollbar narrows the textarea's text but not the overlay's, so leave its width out.
-    const scrollbarWidth = textArea.offsetWidth - textArea.clientWidth
-        - parseFloat(styles.borderLeftWidth) - parseFloat(styles.borderRightWidth);
-    highlightOverlay.style.width = `${box.width - scrollbarWidth}px`;
-    highlightOverlay.style.height = `${box.height}px`;
-
-    // Copy text rendering styles so characters align exactly
-    highlightOverlay.style.font = styles.font;
-    highlightOverlay.style.fontSize = styles.fontSize;
-    highlightOverlay.style.fontFamily = styles.fontFamily;
-    highlightOverlay.style.fontWeight = styles.fontWeight;
-    highlightOverlay.style.lineHeight = styles.lineHeight;
-    highlightOverlay.style.letterSpacing = styles.letterSpacing;
-    highlightOverlay.style.wordSpacing = styles.wordSpacing;
-    highlightOverlay.style.textIndent = styles.textIndent;
-    highlightOverlay.style.whiteSpace = styles.whiteSpace || 'pre-wrap';
-    highlightOverlay.style.wordWrap = styles.wordWrap || 'break-word';
-    highlightOverlay.style.overflowWrap = styles.overflowWrap || 'break-word';
-    highlightOverlay.style.padding = styles.padding;
-    // Side by side, because a shorthand with per-side widths is not a valid border value
-    for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
-        highlightOverlay.style[`border${side}`] = `${styles[`border${side}Width`]} solid transparent`;
-    }
-    highlightOverlay.style.boxSizing = styles.boxSizing;
-    highlightOverlay.style.tabSize = styles.tabSize;
-}
-
-/**
- * Update the highlight overlay content with misspelled word markers.
- * @param {string} text - The current textarea text
- * @param {Array} misspellings - Array of misspelling objects with start/end/word
- */
-function updateHighlightOverlay(text, misspellings = []) {
-    if (!highlightOverlay) return;
-
-    if (!text || misspellings.length === 0) {
-        highlightOverlay.innerHTML = '';
-        return;
-    }
-
-    let html = '';
-    let lastIndex = 0;
-
-    misspellings.forEach((m, index) => {
-        // Text around the misspelling is invisible but takes up the same space
-        html += escapeHtml(text.substring(lastIndex, m.start));
-        html += `<span class="st-spellcheck-misspelled" data-index="${index}">${escapeHtml(m.word)}</span>`;
-        lastIndex = m.end;
-    });
-
-    // The zero-width space gives a trailing newline a line to occupy, as a textarea does
-    html += escapeHtml(text.substring(lastIndex)) + '\u200b';
-
-    highlightOverlay.innerHTML = html;
-
-    const textArea = document.getElementById('send_textarea');
-    if (textArea) {
-        highlightOverlay.scrollTop = textArea.scrollTop;
-        highlightOverlay.scrollLeft = textArea.scrollLeft;
-    }
-}
-
-/**
- * Whether the chat box should be checked right now.
- */
-function isLiveCheckActive() {
-    return Boolean(extensionSettings?.enabled && checker && isSpellcheckEnabledForCharacter());
-}
-
-/**
- * Check the chat box soon. Several changes in one tick (typing, then the caret moving)
- * collapse into one check. Checking is fast enough to skip a longer debounce, which would
- * leave the underlines out of step with the text while typing.
+ * Check every field already in use again, after something that changes the results.
  */
 function scheduleLiveCheck() {
-    if (liveCheckTimer !== null) return;
-    liveCheckTimer = setTimeout(() => {
-        liveCheckTimer = null;
-        runLiveCheck();
-    }, 0);
+    fieldChecking?.refreshAll();
 }
 
 /**
- * Check the chat box and update the underlines and badge.
- */
-async function runLiveCheck() {
-    const textArea = document.getElementById('send_textarea');
-    if (!textArea) return;
-
-    const generation = ++liveCheckGeneration;
-    const textToPrepare = textArea.value;
-    await prepareToCheck(textToPrepare);
-    // Typing while that was waiting has already scheduled a newer check
-    if (generation !== liveCheckGeneration || textArea.value !== textToPrepare) return;
-
-    if (!isLiveCheckActive()) {
-        currentMisspellings = [];
-        updateHighlightOverlay('');
-        updateBadge(0);
-        return;
-    }
-
-    // Leave a word alone while it is being typed. Only typing counts: clicking into a flagged
-    // word must not hide its underline, or a right-click would remove what it is aiming at.
-    const isTyping = document.activeElement === textArea && textArea.selectionStart === typingCaret;
-    if (!isTyping) typingCaret = null;
-    const text = textArea.value;
-    currentMisspellings = performLocalSpellCheck(text, { caret: isTyping ? typingCaret : null }).misspellings;
-    syncOverlayStyles();
-    updateBadge(currentMisspellings.length);
-    updateHighlightOverlay(extensionSettings.showInlineHighlights ? text : '', currentMisspellings);
-}
-
-/**
- * Apply the on/off state. The browser's own spellchecker only knows one language, so it
- * has to be off in the chat box while this one is on, or English gets flagged underneath.
+ * Apply the on/off state. The browser's own spellchecker only knows one language, so it has to
+ * be off across the app while this one is on, or English gets flagged in every other box.
  */
 function refreshSpellcheckState() {
-    const textArea = document.getElementById('send_textarea');
-    if (textArea) {
-        if (isLiveCheckActive()) {
-            textArea.spellcheck = false;
-        } else {
-            // Falls back to the app's own spellcheck setting
-            textArea.removeAttribute('spellcheck');
-        }
-    }
+    const appSetting = SillyTavern.getContext().powerUserSettings?.spellcheck_enabled !== false;
+    document.body.spellcheck = isSpellcheckOn() ? false : appSetting;
     scheduleLiveCheck();
+}
+
+/**
+ * Start checking fields as they get focus, beginning with the chat box.
+ */
+function startFieldChecking() {
+    fieldChecking = createFieldChecking({
+        isActive: (field) => {
+            if (!isSpellcheckOn() || !extensionSettings.showInlineHighlights) return false;
+            // The per-character switch is about chatting, so it only covers the chat itself
+            const inChat = field.isChatBox || field.element.closest('#chat');
+            return !inChat || isSpellcheckEnabledForCharacter();
+        },
+        prepare: prepareToCheck,
+        findMisspellings: (text, caret) => performLocalSpellCheck(text, { caret }).misspellings,
+        onChecked: (field) => {
+            if (field.isChatBox) updateBadge(field.misspellings.length);
+        },
+    });
+
+    const chatBox = document.getElementById('send_textarea');
+    if (chatBox) {
+        chatBox.removeAttribute('spellcheck');
+        fieldChecking.attach(chatBox);
+    } else {
+        logError('send_textarea not found');
+    }
+    refreshSpellcheckState();
+
+    // The app's handler for its own Spellcheck setting turns the browser's spellchecker back on
+    document.getElementById('spellcheck_enabled')?.addEventListener('input', refreshSpellcheckState);
 }
 
 /**
@@ -1082,22 +940,7 @@ function registerEventListeners(context) {
         });
     }
 
-    // Real-time spell check on textarea input
-    const textArea = document.getElementById('send_textarea');
-    if (textArea) {
-        textArea.addEventListener('input', () => {
-            typingCaret = textArea.selectionStart === textArea.selectionEnd ? textArea.selectionStart : null;
-            scheduleLiveCheck();
-        });
-        textArea.addEventListener('blur', scheduleLiveCheck);
-        // Moving the caret off a word finishes it
-        document.addEventListener('selectionchange', () => {
-            if (document.activeElement === textArea) scheduleLiveCheck();
-        });
-        refreshSpellcheckState();
-    } else {
-        logError('send_textarea not found, real-time spell check will not activate');
-    }
+    startFieldChecking();
 
     // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
@@ -1162,31 +1005,14 @@ function registerSlashCommands(context) {
  * @param {Event} e - Context menu event
  */
 function handleContextMenu(e) {
-    if (e.target?.id !== 'send_textarea') return;
+    const field = fieldChecking?.fieldFor(e.target);
+    if (!field) return;
 
-    // The overlay lets clicks through to the textarea, so find the word by position
-    const misspelling = findMisspellingAt(e.clientX, e.clientY);
+    const misspelling = field.misspellingAt(e.clientX, e.clientY);
     if (misspelling) {
         e.preventDefault();
         showWordContextMenu(e, misspelling);
     }
-}
-
-/**
- * Find the underlined word at a point on screen.
- * @param {number} x - Client X
- * @param {number} y - Client Y
- * @returns {object|undefined} The misspelling there, if any
- */
-function findMisspellingAt(x, y) {
-    for (const span of highlightOverlay?.querySelectorAll('.st-spellcheck-misspelled') ?? []) {
-        for (const rect of span.getClientRects()) {
-            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
-                return currentMisspellings[Number(span.dataset.index)];
-            }
-        }
-    }
-    return undefined;
 }
 
 /**
@@ -1226,7 +1052,7 @@ async function showWordContextMenu(e, misspelling) {
     // Bind events
     menu.querySelectorAll('.st-spellcheck-suggestion').forEach(item => {
         item.addEventListener('click', () => {
-            applySuggestion(misspelling, item.dataset.suggestion);
+            applySuggestion(e.target, misspelling, item.dataset.suggestion);
             menu.remove();
         });
     });
@@ -1236,13 +1062,18 @@ async function showWordContextMenu(e, misspelling) {
         menu.remove();
     });
 
-    document.body.appendChild(menu);
+    // Inside an open dialog, or the dialog would cover it: dialogs sit above the rest of the page
+    (e.target.closest('dialog') ?? document.body).appendChild(menu);
 
     // The chat box sits at the bottom of the window, so open upward when there is no room below
     const { width, height } = menu.getBoundingClientRect();
-    if (e.clientY + height > window.innerHeight) {
-        const lineHeight = parseFloat(window.getComputedStyle(e.target).lineHeight) || 20;
-        menu.style.top = `${Math.max(0, e.pageY - height - lineHeight)}px`;
+    // Either way, keep clear of the line that was clicked so the word stays readable
+    const lineHeight = parseFloat(window.getComputedStyle(e.target).lineHeight) || 20;
+    const below = e.clientY + lineHeight * 0.75;
+    if (below + height > window.innerHeight) {
+        menu.style.top = `${Math.max(0, e.clientY - height - lineHeight)}px`;
+    } else {
+        menu.style.top = `${below}px`;
     }
     if (e.clientX + width > window.innerWidth) {
         menu.style.left = `${Math.max(0, e.pageX - width)}px`;
@@ -1260,37 +1091,15 @@ async function showWordContextMenu(e, misspelling) {
 
 /**
  * Apply a spelling suggestion
+ * @param {Element} target - The field the word is in, or an element inside it
  * @param {object} misspelling - The misspelled word and where it is
  * @param {string} suggestion - Suggested replacement
  */
-function applySuggestion(misspelling, suggestion) {
-    const textArea = document.getElementById('send_textarea');
-    if (!textArea) return;
-
-    const { word, start, end } = misspelling;
-    if (textArea.value.slice(start, end) !== word) {
+function applySuggestion(target, misspelling, suggestion) {
+    const field = fieldChecking?.fieldFor(target);
+    if (!field?.replace(misspelling, suggestion)) {
         showToast('The text changed, so the suggestion was not applied.', 'info');
-        scheduleLiveCheck();
-        return;
-    }
-
-    replaceTextRange(textArea, start, end, suggestion);
-}
-
-/**
- * Replace part of the chat box the way typing would: it stays on the normal Ctrl+Z history,
- * and the app and this extension both see the change.
- * @param {HTMLTextAreaElement} textArea
- * @param {number} start
- * @param {number} end
- * @param {string} text
- */
-function replaceTextRange(textArea, start, end, text) {
-    textArea.focus();
-    textArea.setSelectionRange(start, end);
-    if (!document.execCommand('insertText', false, text)) {
-        textArea.setRangeText(text, start, end, 'end');
-        textArea.dispatchEvent(new Event('input', { bubbles: true }));
+        field?.schedule();
     }
 }
 
