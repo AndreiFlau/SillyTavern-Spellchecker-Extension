@@ -25,6 +25,7 @@ const DEFAULT_SETTINGS = {
     customDictionary: [],
     characterSettings: {}, // { characterId: { enabled: boolean } }
     showInlineHighlights: true,
+    showLocalButton: false, // The underlines do this job live, so the button is optional
 };
 
 // State management
@@ -244,6 +245,8 @@ function addSpellcheckButtons() {
         sendFormContainer.appendChild(buttonContainer);
     }
 
+    updateButtonVisibility();
+
     // Add disabled indicator if character has spell check disabled
     updateCharacterDisabledIndicator();
 }
@@ -280,6 +283,14 @@ function addSettingsPanel() {
                         <input type="checkbox" id="st-spellcheck-auto-check" />
                         <span>Auto-check before sending</span>
                     </label>
+                </div>
+
+                <div class="st-spellcheck-setting">
+                    <label class="checkbox_label">
+                        <input type="checkbox" id="st-spellcheck-show-local-btn" />
+                        <span>Show spell check button in the chat bar</span>
+                    </label>
+                    <small class="st-spellcheck-hint">Opens the list of corrections and shows how many errors were found. Ctrl+Shift+S and /spellcheck work without it.</small>
                 </div>
 
                 <div class="st-spellcheck-setting">
@@ -366,6 +377,16 @@ function bindSettingsEvents() {
         });
     }
 
+    // Local spell check button in the chat bar
+    const showLocalButtonCheckbox = document.getElementById('st-spellcheck-show-local-btn');
+    if (showLocalButtonCheckbox) {
+        showLocalButtonCheckbox.addEventListener('change', (e) => {
+            extensionSettings.showLocalButton = e.target.checked;
+            saveSettings();
+            updateButtonVisibility();
+        });
+    }
+
     // Correction intensity
     const intensitySelect = document.getElementById('st-spellcheck-intensity');
     if (intensitySelect) {
@@ -438,6 +459,9 @@ function updateSettingsUI() {
     const autoCheckCheckbox = document.getElementById('st-spellcheck-auto-check');
     if (autoCheckCheckbox) autoCheckCheckbox.checked = extensionSettings.autoCheckBeforeSend;
 
+    const showLocalButtonCheckbox = document.getElementById('st-spellcheck-show-local-btn');
+    if (showLocalButtonCheckbox) showLocalButtonCheckbox.checked = extensionSettings.showLocalButton;
+
     const intensitySelect = document.getElementById('st-spellcheck-intensity');
     if (intensitySelect) intensitySelect.value = extensionSettings.correctionIntensity;
 
@@ -480,6 +504,10 @@ function updateButtonVisibility() {
     const buttonContainer = document.getElementById('st-spellcheck-buttons');
     if (buttonContainer) {
         buttonContainer.style.display = extensionSettings.enabled ? 'flex' : 'none';
+    }
+    const localButton = document.getElementById('st-spellcheck-local-btn');
+    if (localButton) {
+        localButton.style.display = extensionSettings.showLocalButton ? 'flex' : 'none';
     }
 }
 

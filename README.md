@@ -281,6 +281,7 @@ Every correction goes through the chat box's normal history, so plain Ctrl+Z und
 
 ### v2.0.0 (multi-language fork)
 
+- The local spell check button is now optional, and off by default: turn it on with **Show spell check button in the chat bar**
 - Checks Brazilian Portuguese and US English at the same time
 - Replaced Typo.js with Hunspell (WebAssembly): Typo.js could not finish loading the Portuguese dictionary in minutes, Hunspell loads both in under a second
 - Fixed the extension failing to load at all (`lib/typo.js` had no ES export)
