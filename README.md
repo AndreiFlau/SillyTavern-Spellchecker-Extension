@@ -17,6 +17,19 @@ This is a fork of [Cheesedozer/SillyTavern-Spellchecker-Extension](https://githu
 
 ---
 
+## Simple mode and the Windows spell checker
+
+**Simple mode** is on by default: squiggly underlines and right-click corrections, like a browser's spellchecker. Untick it in the extension's settings to get the buttons, the roleplay exceptions and AI Polish.
+
+**To use the Windows spell checker** (recommended on Windows), a browser extension needs a small helper, because it cannot reach Windows by itself:
+
+1. Run `windows-helper\build.cmd` once. It builds `st-spellcheck-helper.exe` using a compiler that comes with Windows.
+2. Start TauriTavern with `st-spellcheck-helper.exe --run-app`, for example from a desktop shortcut. The helper closes when TauriTavern does.
+
+The settings panel shows which engine is in use. Without the helper the extension uses its built-in dictionaries. The helper only listens on `127.0.0.1`, stores nothing and refuses requests from other web pages. Windows needs both languages installed under Settings > Time & language.
+
+On Wikipedia articles with typos inserted, the Windows checker offered the right word first about 78% of the time against about 71% for the built-in dictionaries, and raised under half as many false alarms in English (1.1% of words against 2.8%). It raised more in Portuguese (2.0% against 1.5%), mostly on technical terms. Both caught about the same share of typos.
+
 ## Features
 
 ### Two-Mode Spell Checking System
@@ -281,6 +294,8 @@ Every correction goes through the chat box's normal history, so plain Ctrl+Z und
 
 ### v2.0.0 (multi-language fork)
 
+- Simple mode, on by default: only squiggly underlines and right-click corrections
+- Can use the Windows spell checker through a small helper, falling back to the built-in dictionaries
 - The local spell check button is now optional, and off by default: turn it on with **Show spell check button in the chat bar**
 - Checks Brazilian Portuguese and US English at the same time
 - Replaced Typo.js with Hunspell (WebAssembly): Typo.js could not finish loading the Portuguese dictionary in minutes, Hunspell loads both in under a second

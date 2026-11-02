@@ -5,8 +5,8 @@
  * @version 2.0.0
  */
 
-import { loadModule } from './lib/hunspell.bundle.js';
-import { createChecker, findMisspellings, findWords } from './lib/spell-core.js';
+import { createChecker, findMisspellings, findWords, normalizeApostrophes, wordsToLookUp } from './lib/spell-core.js';
+import { connectWindowsEngine } from './lib/windows-engine.js';
 
 const MODULE_NAME = 'ST-Spellcheck';
 const LOG_PREFIX = `[${MODULE_NAME}]`;
@@ -26,10 +26,14 @@ const DEFAULT_SETTINGS = {
     characterSettings: {}, // { characterId: { enabled: boolean } }
     showInlineHighlights: true,
     showLocalButton: false, // The underlines do this job live, so the button is optional
+    simpleMode: true, // Just squiggly underlines and right-click, like a browser's spellchecker
 };
 
 // State management
 let checker = null;
+let engine = null; // The Windows helper's connection, or null when using the built-in dictionaries
+let engineName = 'Not loaded';
+let liveCheckGeneration = 0; // Lets a slow check notice that a newer one has replaced it
 let extensionSettings = null;
 let isInitialized = false;
 let currentMisspellings = []; // What the overlay currently shows, for right-click lookups
@@ -77,7 +81,7 @@ async function init() {
         // Load extension settings
         await loadSettings(context);
 
-        await initializeDictionaries();
+        await initializeEngine();
         refreshKnownNames();
 
         // Register UI elements
@@ -146,10 +150,11 @@ async function loadDictionary(factory, code) {
 }
 
 /**
- * Load every dictionary. One failing still leaves the other working, but says so.
+ * Load the built-in dictionaries. One failing still leaves the other working, but says so.
  */
-async function initializeDictionaries() {
+async function initializeBuiltInDictionaries() {
     try {
+        const { loadModule } = await import('./lib/hunspell.bundle.js');
         const factory = await loadModule();
         const results = await Promise.allSettled(DICTIONARIES.map((code) => loadDictionary(factory, code)));
         const spellers = [];
@@ -163,12 +168,77 @@ async function initializeDictionaries() {
         });
         if (spellers.length > 0) {
             checker = createChecker(spellers);
+            engineName = 'Built-in dictionaries';
             log(`Loaded ${spellers.length} of ${DICTIONARIES.length} dictionaries`);
         }
     } catch (error) {
         logError('Failed to start the spell check engine:', error);
         showToast('The spell check engine failed to start. Spell check is unavailable.', 'error');
     }
+}
+
+/**
+ * Use the Windows spell checker when its helper is running, otherwise the built-in dictionaries.
+ */
+async function initializeEngine() {
+    engine = await connectWindowsEngine();
+    if (engine) {
+        checker = createChecker(engine.spellers);
+        engineName = 'Windows spell checker';
+        log('Using the Windows spell checker');
+    } else {
+        await initializeBuiltInDictionaries();
+    }
+    updateEngineStatus();
+}
+
+/**
+ * The helper stopped answering, so carry on with the built-in dictionaries.
+ * @param {Error} error
+ */
+async function fallBackToBuiltIn(error) {
+    logError('Lost the Windows spell checker:', error);
+    engine = null;
+    checker = null;
+    await initializeBuiltInDictionaries();
+    updateEngineStatus();
+}
+
+/**
+ * Fetch what a check of this text will need. Does nothing for the built-in dictionaries.
+ * @param {string} text
+ */
+async function prepareToCheck(text) {
+    if (!engine) return;
+    try {
+        await engine.prepare(wordsToLookUp(text));
+    } catch (error) {
+        await fallBackToBuiltIn(error);
+    }
+}
+
+/**
+ * Get suggestions for a word, from whichever engine is active.
+ * @param {string} word
+ * @returns {Promise<string[]>}
+ */
+async function getSuggestions(word) {
+    if (engine) {
+        try {
+            await engine.prepareSuggestions(normalizeApostrophes(word));
+        } catch (error) {
+            await fallBackToBuiltIn(error);
+        }
+    }
+    return checker ? checker.suggest(word) : [];
+}
+
+/**
+ * Show which engine is in use in the settings panel.
+ */
+function updateEngineStatus() {
+    const status = document.getElementById('st-spellcheck-engine');
+    if (status) status.textContent = engineName;
 }
 
 /**
@@ -272,6 +342,19 @@ function addSettingsPanel() {
 
                 <div class="st-spellcheck-setting">
                     <label class="checkbox_label">
+                        <input type="checkbox" id="st-spellcheck-simple" />
+                        <span>Simple mode</span>
+                    </label>
+                    <small class="st-spellcheck-hint">Works like a browser's spellchecker: squiggly underlines and right-click corrections, and nothing else.</small>
+                </div>
+
+                <div class="st-spellcheck-setting">
+                    <small class="st-spellcheck-hint">Engine: <span id="st-spellcheck-engine">Not loaded</span></small>
+                </div>
+
+                <div id="st-spellcheck-advanced">
+                <div class="st-spellcheck-setting">
+                    <label class="checkbox_label">
                         <input type="checkbox" id="st-spellcheck-roleplay-aware" />
                         <span>Roleplay-Aware Mode</span>
                     </label>
@@ -300,6 +383,7 @@ function addSettingsPanel() {
                         <option value="medium">Medium - Typos + basic grammar</option>
                         <option value="heavy">Heavy - Full rewrite for flow</option>
                     </select>
+                </div>
                 </div>
 
                 <hr class="st-spellcheck-divider" />
@@ -338,6 +422,7 @@ function addSettingsPanel() {
         extensionsSettings.insertAdjacentHTML('beforeend', settingsHtml);
         bindSettingsEvents();
         updateSettingsUI();
+        updateButtonVisibility();
     } else {
         logError('Extensions settings container not found');
     }
@@ -355,6 +440,17 @@ function bindSettingsEvents() {
             saveSettings();
             updateButtonVisibility();
             refreshSpellcheckState();
+        });
+    }
+
+    // Simple mode
+    const simpleCheckbox = document.getElementById('st-spellcheck-simple');
+    if (simpleCheckbox) {
+        simpleCheckbox.addEventListener('change', (e) => {
+            extensionSettings.simpleMode = e.target.checked;
+            saveSettings();
+            updateButtonVisibility();
+            scheduleLiveCheck();
         });
     }
 
@@ -453,6 +549,11 @@ function updateSettingsUI() {
     const enabledCheckbox = document.getElementById('st-spellcheck-enabled');
     if (enabledCheckbox) enabledCheckbox.checked = extensionSettings.enabled;
 
+    const simpleCheckbox = document.getElementById('st-spellcheck-simple');
+    if (simpleCheckbox) simpleCheckbox.checked = extensionSettings.simpleMode;
+
+    updateEngineStatus();
+
     const roleplayCheckbox = document.getElementById('st-spellcheck-roleplay-aware');
     if (roleplayCheckbox) roleplayCheckbox.checked = extensionSettings.roleplayAwareMode;
 
@@ -503,7 +604,11 @@ function updateDictionaryList() {
 function updateButtonVisibility() {
     const buttonContainer = document.getElementById('st-spellcheck-buttons');
     if (buttonContainer) {
-        buttonContainer.style.display = extensionSettings.enabled ? 'flex' : 'none';
+        buttonContainer.style.display = extensionSettings.enabled && !extensionSettings.simpleMode ? 'flex' : 'none';
+    }
+    const advanced = document.getElementById('st-spellcheck-advanced');
+    if (advanced) {
+        advanced.style.display = extensionSettings.simpleMode ? 'none' : '';
     }
     const localButton = document.getElementById('st-spellcheck-local-btn');
     if (localButton) {
@@ -886,9 +991,15 @@ function scheduleLiveCheck() {
 /**
  * Check the chat box and update the underlines and badge.
  */
-function runLiveCheck() {
+async function runLiveCheck() {
     const textArea = document.getElementById('send_textarea');
     if (!textArea) return;
+
+    const generation = ++liveCheckGeneration;
+    const textToPrepare = textArea.value;
+    await prepareToCheck(textToPrepare);
+    // Typing while that was waiting has already scheduled a newer check
+    if (generation !== liveCheckGeneration || textArea.value !== textToPrepare) return;
 
     if (!isLiveCheckActive()) {
         currentMisspellings = [];
@@ -960,6 +1071,7 @@ function registerEventListeners(context) {
                 // Only do local spell check for auto-check, not AI polish
                 const textArea = document.getElementById('send_textarea');
                 if (textArea && textArea.value.trim()) {
+                    await prepareToCheck(textArea.value);
                     const result = performLocalSpellCheck(textArea.value);
                     if (result.misspellings.length > 0) {
                         // Show notification but don't block
@@ -1082,14 +1194,14 @@ function findMisspellingAt(x, y) {
  * @param {Event} e - Mouse event
  * @param {object} misspelling - The misspelled word and where it is
  */
-function showWordContextMenu(e, misspelling) {
+async function showWordContextMenu(e, misspelling) {
     const { word } = misspelling;
     // Remove any existing context menu
     const existingMenu = document.querySelector('.st-spellcheck-context-menu');
     if (existingMenu) existingMenu.remove();
 
     // Get suggestions
-    const suggestions = checker ? checker.suggest(word) : [];
+    const suggestions = await getSuggestions(word);
 
     const menu = document.createElement('div');
     menu.className = 'st-spellcheck-context-menu';
@@ -1208,6 +1320,7 @@ async function handleLocalSpellCheck() {
     }
 
     log('Running local spell check...');
+    await prepareToCheck(textArea.value);
     const result = performLocalSpellCheck(textArea.value);
 
     if (result.misspellings.length === 0) {
@@ -1221,7 +1334,7 @@ async function handleLocalSpellCheck() {
 
     // Suggestions are slower than checking, so they are only worked out here and on right-click
     for (const misspelling of result.misspellings) {
-        misspelling.suggestions = checker.suggest(misspelling.word);
+        misspelling.suggestions = await getSuggestions(misspelling.word);
     }
 
     // Show diff preview
@@ -1236,9 +1349,11 @@ async function handleLocalSpellCheck() {
  * @returns {{misspellings: {word: string, start: number, end: number}[]}} What was found
  */
 function performLocalSpellCheck(text, { caret = null } = {}) {
+    // Simple mode flags what a browser would: no roleplay exceptions, and names are not special
+    const { simpleMode } = extensionSettings;
     const misspellings = findMisspellings(text, checker, {
-        roleplayAware: extensionSettings.roleplayAwareMode,
-        knownWords: new Set([...extensionSettings.customDictionary, ...knownNames]),
+        roleplayAware: !simpleMode && extensionSettings.roleplayAwareMode,
+        knownWords: new Set(simpleMode ? extensionSettings.customDictionary : [...extensionSettings.customDictionary, ...knownNames]),
         caret,
     });
     return { misspellings };
